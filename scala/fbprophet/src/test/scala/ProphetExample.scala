@@ -10,7 +10,8 @@ object ProphetExample extends App {
   val model = new Prophet()
   val data: Seq[Double] = source.read(model.y, "y")
   val ds: Seq[Double] = source.read(model.t, "ds")
-  val history: Map[String, Seq[Any]] = Map("y" -> data, "ds" -> ds)
+
+  val history: Map[String, Stream[Any]] = Map("y" -> data.toStream, "ds" -> ds.toStream)
   val results = model.fit(history)
   results.summary(System.out)
   results.mean(model.k)
