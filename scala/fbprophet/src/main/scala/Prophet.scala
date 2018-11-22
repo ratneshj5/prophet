@@ -1,11 +1,15 @@
+import java.util.concurrent.TimeUnit
+
 import Domain.{Holiday, Regressor, Seasonality}
 import Models.ProphetStanModel
+import Prophet._
 import com.cibo.scalastan.RunMethod.OptimizeAlgorithm
 import com.cibo.scalastan.{RunMethod, StanResults}
 
 import scala.collection.mutable
 
 /**
+  * Prophet forecaster.
   *
   * @param growth                : 'linear' or 'logistic' to specify a linear or logistic trend.
   * @param changePoints          : List of epochs at which to include potential changepoints.
@@ -68,12 +72,10 @@ class Prophet(growth: String = "linear",
               intervalWidth: Double = 0.80, // Number of regressors
               uncertaintySamples: Int = 1000 // Capacities for logistic trend
              ) extends ProphetStanModel {
+  val changepoints_t: mutable.Seq[Double] = mutable.Seq.empty
 
   if (changePoints.nonEmpty) nChangePoints = changePoints.length
   validate_inputs()
-
-  val changepoints_t: mutable.Seq[Double] = mutable.Seq.empty
-  val params: Seq[(String, Stream[Any])] => mutable.Map[String, Stream[Any]] = collection.mutable.Map[String, Stream[Any]]
   var seasonalities: mutable.Seq[Seasonality] = mutable.Seq.empty
   var regressors: mutable.Seq[Regressor] = mutable.Seq.empty
 
@@ -84,19 +86,69 @@ class Prophet(growth: String = "linear",
   var logistic_floor: Boolean = false
   var t_scale: Double = 0
 
-  /*
-      Validates the inputs to Prophet
-   */
-  def validate_inputs() {
-    if (!(growth == "linear" || growth == "logistic")) {
-      throw new RuntimeException("Parameter 'growth' should be 'linear' or 'logistic'.")
+  /**
+    * Add an additional regressor to be used for fitting and predicting.
+    *
+    * The dataframe passed to `fit` and `predict` will have a column with the
+    * specified name to be used as a regressor. When standardize='auto', the
+    * regressor will be standardized unless it is binary. The regression
+    * coefficient is given a prior with the specified scale parameter.
+    * Decreasing the prior scale will add additional regularization. If no
+    * prior scale is provided, self.holidays_prior_scale will be used.
+    * Mode can be specified as either 'additive' or 'multiplicative'. If not
+    * specified, self.seasonality_mode will be used. 'additive' means the
+    * effect of the regressor will be added to the trend, 'multiplicative'
+    * means it will multiply the trend.
+    *
+    * @param name        : string name of the regressor.
+    * @param standardize : optional, specify whether this regressor will be
+    *                    standardized prior to fitting. Can be 'auto' (standardize if not
+    *                    binary), True, or False.
+    * @param priorScale  : optional float scale for the normal prior. If not
+    *                    provided, self.holidays_prior_scale will be used.
+    * @param mode        : optional, 'additive' or 'multiplicative'. Defaults to
+    *             self.seasonality_mode.
+    */
+
+  def add_regressor(name: String, standardize: Option[Boolean],
+                    priorScale: Option[Double] = None, mode: Option[String] = None) {
+    if (history.nonEmpty) throw new RuntimeException("Regressors must be added prior to model fitting.")
+    validate_column_name(name, check_regressors = false)
+    val ps = priorScale.getOrElse(seasonalityPriorScale)
+    if (ps <= 0) throw new RuntimeException("Prior scale must be >0")
+
+    val md = mode.getOrElse(seasonalityMode)
+    if (!Seq("additive", "multiplicative").contains(md))
+      throw new RuntimeException("mode must be 'additive' or 'multiplicative'")
+    regressors = regressors :+ Domain.Regressor(name, 0, 1, standardize, Some(ps), Some(md))
+  }
+
+  /**
+    *
+    * @param name                :String
+    * @param check_holidays      :Boolean, check if name already used for holiday
+    * @param check_seasonalities :Boolean, check if name already used for seasonality
+    * @param check_regressors    :Boolean, check if name already used for regressor
+    * @return
+    */
+  private def validate_column_name(name: String, check_holidays: Boolean = true,
+                                   check_seasonalities: Boolean = true, check_regressors: Boolean = true): Unit = {
+
+    if (name.contains('_delim_)) throw new RuntimeException("Name cannot contain '_delim_'")
+    var reserved_names = Seq("trend", "additive_terms", "daily", "weekly", "yearly", "holidays",
+      "zeros", "extra_regressors_additive", "yhat", "extra_regressors_multiplicative",
+      "multiplicative_terms", "ds", "y", "cap", "floor", "y_scaled", "cap_scaled")
+    val rn_l = reserved_names.map(a => a + "_lower")
+    val rn_u = reserved_names.map(a => a + "_upper")
+    reserved_names = reserved_names ++ rn_l ++ rn_u
+    if (reserved_names.contains(name)) {
+      throw new RuntimeException(s"Name  $name  is reserved")
     }
-    if ((changePointRange < 0) || (changePointRange > 1)) {
-      throw new RuntimeException("Parameter 'changePointRange' must be in [0, 1]")
-    }
-    if (!(seasonalityMode == "additive" || seasonalityMode == "multiplicative")) {
-      throw new RuntimeException("seasonalityMode must be 'additive' or 'multiplicative'")
-    }
+    if (check_seasonalities && seasonalities.map(s => s.name).contains(name))
+      throw new RuntimeException(s"Name $name is already used for a seasonality")
+
+    if (check_regressors && regressors.map(s => s.name).contains(name))
+      throw new RuntimeException(s"Name $name is already used for a regressor")
   }
 
   /**
@@ -125,9 +177,11 @@ class Prophet(growth: String = "linear",
     */
 
 
-  def add_seasonality(name: String, period: Double, fourier_order: Int, prior_scale: Option[Double] = None, mode: Option[String] = None) {
+  def add_seasonality(name: String, period: Double, fourier_order: Int,
+                      prior_scale: Option[Double] = None, mode: Option[String] = None) {
 
-    if (history.nonEmpty) throw new RuntimeException("Seasonality must be added prior to model fitting.")
+    if (history.nonEmpty)
+      throw new RuntimeException("Seasonality must be added prior to model fitting.")
     if (!Seq("daily", "weekly", "yearly").contains(name)) {
       // Allow overwriting built-in seasonalities
       validate_column_name(name, check_seasonalities = false)
@@ -136,66 +190,9 @@ class Prophet(growth: String = "linear",
     if (ps <= 0) throw new RuntimeException("Prior scale must be >0")
 
     val md = mode.getOrElse(seasonalityMode)
-    if (!Seq("additive", "multiplicative").contains(md)) throw new RuntimeException("mode must be 'additive' or 'multiplicative'")
-    seasonalities = seasonalities :+ Seasonality(name, period, fourier_order, Some(ps), mode)
-  }
-
-  /**
-    *
-    * @param name                :String
-    * @param check_holidays      :Boolean, check if name already used for holiday
-    * @param check_seasonalities :Boolean, check if name already used for seasonality
-    * @param check_regressors    :Boolean, check if name already used for regressor
-    * @return
-    */
-  def validate_column_name(name: String, check_holidays: Boolean = true,
-                           check_seasonalities: Boolean = true, check_regressors: Boolean = true) = {
-
-    if (name.contains('_delim_)) throw new RuntimeException("Name cannot contain '_delim_'")
-    var reserved_names = Seq("trend", "additive_terms", "daily", "weekly", "yearly", "holidays", "zeros", "extra_regressors_additive", "yhat", "extra_regressors_multiplicative", "multiplicative_terms", "ds", "y", "cap", "floor", "y_scaled", "cap_scaled")
-    val rn_l = reserved_names.map(a => a + "_lower")
-    val rn_u = reserved_names.map(a => a + "_upper")
-    reserved_names = reserved_names ++ rn_l ++ rn_u
-    if (reserved_names.contains(name)) {
-      throw new RuntimeException("Name " + name + " is reserved")
-    }
-    if (check_seasonalities && seasonalities.map(s => s.name).contains(name)) throw new RuntimeException("Name " + name + " is already used for a seasonality")
-
-    if (check_regressors && regressors.map(s => s.name).contains(name)) throw new RuntimeException("Name " + name + " is already used for a regressor")
-  }
-
-  /**
-    * Add an additional regressor to be used for fitting and predicting.
-    *
-    * The dataframe passed to `fit` and `predict` will have a column with the
-    * specified name to be used as a regressor. When standardize='auto', the
-    * regressor will be standardized unless it is binary. The regression
-    * coefficient is given a prior with the specified scale parameter.
-    * Decreasing the prior scale will add additional regularization. If no
-    * prior scale is provided, self.holidays_prior_scale will be used.
-    * Mode can be specified as either 'additive' or 'multiplicative'. If not
-    * specified, self.seasonality_mode will be used. 'additive' means the
-    * effect of the regressor will be added to the trend, 'multiplicative'
-    * means it will multiply the trend.
-    *
-    * @param name        : string name of the regressor.
-    * @param standardize : optional, specify whether this regressor will be
-    *                    standardized prior to fitting. Can be 'auto' (standardize if not
-    *                    binary), True, or False.
-    * @param priorScale  : optional float scale for the normal prior. If not
-    *                    provided, self.holidays_prior_scale will be used.
-    * @param mode        : optional, 'additive' or 'multiplicative'. Defaults to
-    *             self.seasonality_mode.
-    */
-  def add_regressor(name: String, standardize: Option[Boolean], priorScale: Option[Double] = None, mode: Option[String] = None) {
-    if (history.nonEmpty) throw new RuntimeException("Regressors must be added prior to model fitting.")
-    validate_column_name(name, check_regressors = false)
-    val ps = priorScale.getOrElse(seasonalityPriorScale)
-    if (ps <= 0) throw new RuntimeException("Prior scale must be >0")
-
-    val md = mode.getOrElse(seasonalityMode)
-    if (!Seq("additive", "multiplicative").contains(md)) throw new RuntimeException("mode must be 'additive' or 'multiplicative'")
-    regressors = regressors :+ Domain.Regressor(name, 0, 1, standardize, Some(ps), Some(md))
+    if (!Seq("additive", "multiplicative").contains(md))
+      throw new RuntimeException("mode must be 'additive' or 'multiplicative'")
+    seasonalities = seasonalities :+ Seasonality(name, period, fourier_order, ps, md)
   }
 
   def fit(events: Map[String, Stream[Any]]): StanResults = {
@@ -211,8 +208,9 @@ class Prophet(growth: String = "linear",
     if (history("y").length < 2) throw new RuntimeException("events has less than 2 non-NaN rows.")
 
 
-    setup_history(history, initialize_scales = true)
-    fourier_series(getDoubleSequence(history("t")), period = 7, series_order = 4)
+    history = setup_history(history, initialize_scales = true)
+    setAutoSeasonalities()
+    makeSeasonalityFeatures(getDoubleSequence(history("t")), 7, 4, "week")
     val seq: Seq[Seq[Double]] = Seq.fill(history("ds").length)(Seq(0))
     val model = super.compile
       .withInitialValue(k, 0.07253355189017519)
@@ -242,50 +240,228 @@ class Prophet(growth: String = "linear",
   }
 
   /**
-    * //    * Provides Fourier series components with the specified frequency
-    * and order.
+    * Creates auxiliary keys 't', 't_ix',
+    * 'y_scaled', and 'cap_scaled'. These columns are used during both
+    * fitting and predicting.
     *
-    * @param ds           : Sequence containing timestamps
-    * @param period       :  Number of days of the period.
-    * @param series_order : Number of components.
+    * @param events            : Map with ds, y, and cap if logistic growth. Any
+    *                          specified additional regressors must also be present.
+    * @param initialize_scales Boolean set scaling factors in self from events
     */
-  def fourier_series(ds: Stream[Double], period: Float, series_order: Int) {
-    ds.map(a => (1 to series_order).map(
-      i => (math.cos(2.0 * (i + 1) * math.Pi * a / period), math.sin(2.0 * (i + 1) * math.Pi * a / period))))
-      .map(a => a.flatten { case (p, q) => Seq(p, q) })
-  }
-
-  private def setup_history(events: mutable.Map[String, Stream[Any]], initialize_scales: Boolean = false): Unit = {
+  private def setup_history(events: mutable.Map[String, Stream[Any]],
+                            initialize_scales: Boolean = false): mutable.Map[String, Stream[Any]] = {
 
     // TODO: Add different timestamps support, assuming long for now
     // TODO: Add timestamps sort support, assuming sorted for now
-    initializeScales(initialize_scales)
-    history.put("t", getDoubleSequence(history("ds")).map(a => (a - start) / t_scale))
-    history.put("y_scaled", getDoubleSequence(history("y")).map(a => a / y_scale))
-    history ++= setAutoSeasonalities()
 
+    regressors.foreach(regressor => if (!events.contains(regressor.name)) {
+      throw new RuntimeException(s"Regressor ${regressor.name} missing from events")
+    })
+    initializeScales(events, initialize_scales)
 
+    if (logistic_floor) {
+      if (!events.contains("floor"))
+        throw new RuntimeException("Expected column 'floor'.")
+    }
+    else events("floor") = Stream.fill(events("ds").length)(0d)
+    val typedY = getDoubleSequence(events("y"))
+
+    val floor = getDoubleSequence(events("floor"))
+
+    if (growth == "logistic") {
+      if (!events.contains("cap"))
+        throw new RuntimeException("Capacities must be supplied for logistic growth in column 'cap'")
+      val typedCap = getDoubleSequence(events("cap"))
+      events.put("cap_scaled", (typedCap zip floor).map(a => Math.abs(a._1 - a._2) / y_scale))
+
+    }
+    events.put("t", getDoubleSequence(events("ds")).map(a => (a - start) / t_scale))
+    if (events.contains("y"))
+      events.put("y_scaled", (typedY zip floor).map(a => Math.abs(a._1 - a._2) / y_scale))
+
+    regressors.foreach(
+      regressor => {
+        getDoubleSequence(events(regressor.name)).foreach(
+          a => (a - regressor.mu) / regressor.std
+        )
+      }
+    )
+    events
   }
 
-  private def initializeScales(initialize_scales: Boolean): Unit = {
+  /**
+    * Sets model scaling factors using events.
+    *
+    * @param events            : Map with ds, y, and cap if logistic growth. Any
+    *                          specified additional regressors must also be present.
+    * @param initialize_scales : Boolean set scaling factors in self from events
+    */
+
+  private def initializeScales(events: mutable.Map[String, Stream[Any]],
+                               initialize_scales: Boolean): Unit = {
     if (!initialize_scales) return
+    var floor: Stream[Double] = Stream.empty
+    val typedDS = getDoubleSequence(events("ds"))
+    val typedY = getDoubleSequence(events("y"))
 
-    y_scale = getDoubleSequence(history("y")).map(a => Math.abs(a)).max
-    if (y_scale == 0) y_scale = 1
+    if (growth == "logistic" && events.contains("floor")) {
+      logistic_floor = true
+      floor = getDoubleSequence(events("floor"))
+    }
+    else {
+      floor = Stream.fill(typedDS.length)(0d)
+    }
+    y_scale = (typedY zip floor).map(a => Math.abs(a._1 - a._2)).max
+    if (y_scale == 0d) y_scale = 1d
 
-    start = getDoubleSequence(history("ds")).min
-    t_scale = getDoubleSequence(history("ds")).max - start
+    start = typedDS.min
+    t_scale = typedDS.max - start
+
+    regressors.foreach(
+      regressor => {
+        var standarize: Option[Boolean] = regressor.standardize
+        val stream = getDoubleSequence(events(regressor.name))
+        val n_vals = stream.distinct.length
+        if (n_vals < 2) standarize = Some(false)
+        if (standarize.isEmpty) {
+          if (stream.distinct.toSet == Set(1d, 0d)) standarize = Some(false)
+          else standarize = Some(true)
+        }
+        if (standarize.get)
+          regressor.mu = stream.sum / stream.length
+        val deviation = stream.map(score => (score - regressor.mu) * (score - regressor.mu))
+        regressor.std = Math.sqrt(deviation.sum / (stream.length - 1))
+      }
+    )
+  }
+
+  /**
+    *
+    * Set seasonalities that were left on auto.
+    *
+    * Turns on yearly seasonality if there is >=2 years of history.
+    * Turns on weekly seasonality if there is >=2 weeks of history, and the
+    * spacing between dates in the history is <7 days.
+    * Turns on daily seasonality if there is >=2 days of history, and the
+    * spacing between dates in the history is <1 day.
+    */
+  private def setAutoSeasonalities(): Unit = {
+    val typedDS = getDoubleSequence(history("ds"))
+    val first = typedDS.min
+    val last = typedDS.max
+    val stream: Stream[Double] = Stream(typedDS.head) #::: typedDS
+    val min_dt = (typedDS zip stream).map({ case (a, b) => a - b }).filter(a => a != 0).min
+
+    // Yearly seasonality
+    val yDisable = (last - first) < TimeUnit.DAYS.toMillis(730)
+    val yOrder = parseSeasonalityArgs("yearly", yearlySeasonality, yDisable, 10)
+    if (yOrder > 0)
+      seasonalities = seasonalities :+ Seasonality("yearly", 365.25, yOrder, seasonalityPriorScale, seasonalityMode)
+
+    val wDisable = (last - first) < TimeUnit.DAYS.toMillis(14) || min_dt >= TimeUnit.DAYS.toMillis(7)
+    val wOrder = parseSeasonalityArgs("weekly", weeklySeasonality, yDisable, 3)
+    if (wOrder > 0)
+      seasonalities = seasonalities :+ Seasonality("weekly", 7, wOrder, seasonalityPriorScale, seasonalityMode)
+
+    val dDisable = (last - first) < TimeUnit.DAYS.toMillis(2) || min_dt >= TimeUnit.DAYS.toMillis(1)
+    val dOrder = parseSeasonalityArgs("daily", dailySeasonality, dDisable, 4)
+    if (dOrder > 0)
+      seasonalities = seasonalities :+ Seasonality("daily", 1, dOrder, seasonalityPriorScale, seasonalityMode)
+  }
+
+  /**
+    *
+    * @param name         : string name of the seasonality component.
+    * @param arg          : 'auto', True, False, or number of fourier components as provided.
+    * @param autoDisable  : bool if seasonality should be disabled when 'auto'.
+    * @param defaultOrder : int default fourier order
+    * @return Number of fourier components, or 0 for disabled.
+    */
+  private def parseSeasonalityArgs(name: String, arg: Any, autoDisable: Boolean, defaultOrder: Int): Int = {
+    var fourierOrder = 0
+    if (arg == "auto") {
+      fourierOrder = 0
+      seasonalities.foreach(seasonality => {
+        if (seasonality.name == name)
+          logger.info(s"Found custom seasonality named $name disabling built-in $name seasonality")
+      })
+      if (autoDisable) {
+        logger.info(s"Disabling $name seasonality. Run prophet with ${name}_seasonality=True to override this.")
+      }
+      else fourierOrder = defaultOrder
+    }
+    else if (arg == true) fourierOrder = defaultOrder
+    else if (arg == false) fourierOrder = 0
+    else fourierOrder = arg.toString.toInt
+
+    fourierOrder
+  }
+
+  private def makeAllSeasonalityFeatures(events: mutable.Map[String, Stream[Any]]): Unit = {
+
+    val seasonalFeatures: mutable.Map[String, Stream[Any]] = mutable.Map.empty
+  }
+
+  /*
+      Validates the inputs to Prophet
+   */
+  private def validate_inputs() {
+    if (!(growth == "linear" || growth == "logistic")) {
+      throw new RuntimeException("Parameter 'growth' should be 'linear' or 'logistic'.")
+    }
+    if ((changePointRange < 0) || (changePointRange > 1)) {
+      throw new RuntimeException("Parameter 'changePointRange' must be in [0, 1]")
+    }
+    if (!(seasonalityMode == "additive" || seasonalityMode == "multiplicative")) {
+      throw new RuntimeException("seasonalityMode must be 'additive' or 'multiplicative'")
+    }
+  }
+}
+
+object Prophet {
+
+  /**
+    *
+    * @param t            : Stream containing epochs
+    * @param period       :  Number of days of the period.
+    * @param series_order : Number of components.
+    * @param prefix       : Prefix for feature key
+    * @return
+    */
+  private def makeSeasonalityFeatures(t: Stream[Double], period: Float, series_order: Int, prefix: String): Map[String, Stream[Any]] = {
+    val events: Map[String, Stream[Any]] = Map.empty
+    val features = fourier_series(t, period, series_order)
+    features.zipWithIndex.foreach(a => {
+      events(prefix + "_delim_" + a._2) = a._1
+    })
+    events
+  }
+
+  /**
+    * Provides Fourier series components with the specified frequency
+    * and order.
+    *
+    * @param t            : Stream containing epochs
+    * @param period       :  Number of days of the period.
+    * @param series_order : Number of components.
+    */
+  private def fourier_series(t: Stream[Double], period: Float, series_order: Int) = {
+    (1 to (2 * series_order)).map(i => {
+      t.map(a => {
+        if (i % 2 == 0) {
+          math.cos(2.0 * (i + 1) * math.Pi * a / period)
+        } else {
+          math.sin(2.0 * (i + 1) * math.Pi * a / period)
+        }
+      })
+    })
   }
 
   private def getDoubleSequence(any: Stream[Any]): Stream[Double] = {
     any.map(a => a.asInstanceOf[Double])
   }
 
-  private def setAutoSeasonalities(): Map[String, Stream[Double]] = {
-    Map("zeros" -> Stream.fill(history.keySet.size)(0))
-  }
-
-  // Needs dummy
+  // Needs dummy because of scala stan bug
   case class Newton() extends OptimizeAlgorithm("newton") {
     def arguments: Seq[String] = build(("DUMMY", "DUMMY", "DUMMY"))
   }

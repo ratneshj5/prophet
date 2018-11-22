@@ -21,9 +21,9 @@ case class with columns holiday (string) and ds (date type)
                       prior_scale: Option[Double]
                     )
 
-  case class Seasonality(name: String, period: Double, fourierOrder: Int, priorScale: Option[Double] = None, mode: Option[String] = None)
+  case class Seasonality(name: String, period: Double, fourierOrder: Int, priorScale: Double, mode: String = "additive")
 
-  case class Regressor(name: String, mu: Double = 0, std: Double = 1, standardize: Option[Boolean], priorScale: Option[Double] = None, mode: Option[String] = None)
+  case class Regressor(name: String, var mu: Double = 0, var std: Double = 1, standardize: Option[Boolean], priorScale: Option[Double] = None, mode: Option[String] = None)
 
 
 }
