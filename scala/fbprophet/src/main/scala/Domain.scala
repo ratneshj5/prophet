@@ -23,7 +23,12 @@ case class with columns holiday (string) and ds (date type)
 
   case class Seasonality(name: String, period: Double, fourierOrder: Int, priorScale: Double, mode: String = "additive")
 
-  case class Regressor(name: String, var mu: Double = 0, var std: Double = 1, standardize: Option[Boolean], priorScale: Option[Double] = None, mode: Option[String] = None)
+  case class Regressor(name: String, var mu: Double = 0, var std: Double = 1, standardize: Option[Boolean], priorScale: Double, mode: String = "additive")
 
+  case class SeasonalData(seasonalFeatures: Stream[Stream[Double]], prior_scales: Stream[Double], s_a: Stream[Double], s_m: Stream[Double])
+
+  case class Parameter(k: Double, m: Double, delta: Seq[Double], sigma_obs: Double, beta: Seq[Double]) {
+    override def toString: String = s"{k : $k, m : $m, delta : $delta, sigma_obs : $sigma_obs, beta : $beta}"
+  }
 
 }
