@@ -1,3 +1,7 @@
+package org.prophet4s.domain
+
+import org.nd4j.linalg.api.ndarray.INDArray
+
 /**
   * User: ratnesh
   * Date: 19/11/18
@@ -25,9 +29,9 @@ case class with columns holiday (string) and ds (date type)
 
   case class Regressor(name: String, var mu: Double = 0, var std: Double = 1, standardize: Option[Boolean], priorScale: Double, mode: String = "additive")
 
-  case class SeasonalData(seasonalFeatures: Stream[Stream[Double]], prior_scales: Stream[Double], s_a: Stream[Double], s_m: Stream[Double])
+  case class SeasonalData(seasonalFeatures: INDArray, prior_scales: Stream[Double], s_a: INDArray, s_m: INDArray)
 
-  case class Parameter(k: Double, m: Double, delta: Seq[Double], sigma_obs: Double, beta: Seq[Double]) {
+  case class Parameter(k: INDArray, m: INDArray, delta: INDArray, sigma_obs: INDArray, beta: INDArray) {
     override def toString: String = s"{k : $k, m : $m, delta : $delta, sigma_obs : $sigma_obs, beta : $beta}"
   }
 
