@@ -10,3 +10,6 @@ libraryDependencies += "com.cibo" %% "scalastan" % "0.8.1"
 libraryDependencies += "org.nd4j" % "nd4j-native-platform" % "0.9.1"
 // https://mvnrepository.com/artifact/org.nd4j/nd4j-api
 libraryDependencies += "org.nd4j" % "nd4j-scala-api" % "0.0.3.5.5.5"
+
+libraryDependencies += "org.scalatest" %% "scalatest" % "3.0.5" % "test"
+

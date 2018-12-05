@@ -125,11 +125,12 @@ class Prophet(growth: String = "linear",
     setAutoSeasonalities()
     val seasonalData = makeAllSeasonalityFeatures(history, seasonalities, regressors)
     setChangePoints()
-    parameter = init_param(history, growth, changePoints.get.length(), seasonalData.prior_scales.length)
+    val nSeasonalFeatures = seasonalData.prior_scales.length
+    parameter = init_param(history, growth, changePoints.get.length(), nSeasonalFeatures)
     val yData: Seq[Double] = history("y_scaled").data().asDouble()
     val deltaData: Seq[Double] = parameter.delta.data().asDouble().toSeq
     val betaData: Seq[Double] = parameter.beta.data().asDouble().toSeq
-    val seasonalFeatures: Seq[Seq[Double]] = seasonalData.seasonalFeatures.data().asDouble().toSeq.sliding(seasonalData.prior_scales.length, seasonalData.prior_scales.length).toSeq
+    val seasonalFeatures: Seq[Seq[Double]] = seasonalData.seasonalFeatures.data().asDouble().toSeq.sliding(nSeasonalFeatures, nSeasonalFeatures).toSeq
     val model = super.compile
       .withInitialValue(k, parameter.k.getDouble(0))
       .withInitialValue(m, parameter.m.getDouble(0))
@@ -138,7 +139,7 @@ class Prophet(growth: String = "linear",
       .withInitialValue(sigma_obs, parameter.sigma_obs.getDouble(0))
       .withData(cap, history("cap_scaled").data().asDouble().toSeq)
       .withData(T, history("ds").length)
-      .withData(K, seasonalData.prior_scales.length)
+      .withData(K, nSeasonalFeatures)
       .withData(S, changePoints.get.length())
       .withData(y, yData)
       .withData(t, history("t").data().asDouble().toSeq)
@@ -301,6 +302,7 @@ class Prophet(growth: String = "linear",
     }
     toPredict("trend") = predict_trend(toPredict)
     toPredict = predict_seasonal_components(toPredict)
+    toPredict("yhat") = toPredict("trend").mul(toPredict("multiplicative_terms").add(1)).add(toPredict("additive_terms"))
     toPredict
   }
 
@@ -323,7 +325,7 @@ class Prophet(growth: String = "linear",
     else {
       trend = piecewise_logistic(t, events("cap_scaled"), deltas, k, m, changePoints.get)
     }
-    trend.mul(y_scale).add(events("floor"))
+    trend.mul(y_scale).add(events("floor")).transpose()
   }
 
   private def predict_seasonal_components(events: mutable.Map[String, INDArray]): mutable.Map[String, INDArray] = {
@@ -704,7 +706,7 @@ object Prophet {
   private def makeAllSeasonalityFeatures(events: mutable.Map[String, INDArray],
                                          seasonalities: Seq[Seasonality], regressors: Seq[Regressor]): SeasonalData = {
     val typedDS = events("ds")
-    var seasonalFeatures: INDArray = zeros(1, 1)
+    var seasonalFeatures: Option[INDArray] = None
     var prior_scales: Stream[Double] = Stream.empty
     var s_a: Stream[Double] = Stream.empty
     var s_m: Stream[Double] = Stream.empty
@@ -713,8 +715,8 @@ object Prophet {
     seasonalities.foreach(seasonality => {
 
       val currentFeatures: INDArray = makeSeasonalityFeatures(events("ds"), seasonality)
-      if (seasonalFeatures.shape() sameElements Array(1, 1)) seasonalFeatures = currentFeatures
-      else seasonalFeatures = concat(1, seasonalFeatures, currentFeatures)
+      if (seasonalFeatures.isEmpty) seasonalFeatures = Some(currentFeatures)
+      else seasonalFeatures = Some(concat(1, seasonalFeatures.get, currentFeatures))
       prior_scales = prior_scales #::: Stream.fill(currentFeatures.size(1))(seasonality.priorScale)
       if (seasonality.mode == "additive") {
         s_a = s_a #::: Stream.fill(currentFeatures.size(1))(1d)
@@ -727,8 +729,8 @@ object Prophet {
 
     regressors.foreach(regressor => {
       val currentFeatures = events(regressor.name)
-      if (seasonalFeatures.shape() sameElements Array(1, 1)) seasonalFeatures = currentFeatures
-      else seasonalFeatures = concat(1, seasonalFeatures, currentFeatures)
+      if (seasonalFeatures.isEmpty) seasonalFeatures = Some(currentFeatures)
+      else seasonalFeatures = Some(concat(1, seasonalFeatures.get, currentFeatures))
       prior_scales = prior_scales #::: Stream(regressor.priorScale)
       if (regressor.mode == "additive") {
         s_a = s_a #::: Stream.fill(currentFeatures.size(1))(1d)
@@ -739,13 +741,13 @@ object Prophet {
       }
     })
 
-    if (seasonalFeatures.shape() sameElements Array(0, 0)) {
-      seasonalFeatures = create(Array.fill(events("ds").length)(0d))
+    if (seasonalFeatures.isEmpty) {
+      seasonalFeatures = Some(create(Array.fill(events("ds").length)(0d)))
       prior_scales = prior_scales #::: Stream(1d)
       s_a = s_a #::: Stream.fill(1)(0d)
       s_m = s_m #::: Stream.fill(1)(0d)
     }
-    SeasonalData(seasonalFeatures, prior_scales, create(s_a.toArray[Double]), create(s_m.toArray[Double]))
+    SeasonalData(seasonalFeatures.get, prior_scales, create(s_a.toArray[Double]), create(s_m.toArray[Double]))
   }
 
   /**
