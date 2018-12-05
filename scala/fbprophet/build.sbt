@@ -13,3 +13,4 @@ libraryDependencies += "org.nd4j" % "nd4j-scala-api" % "0.0.3.5.5.5"
 
 libraryDependencies += "org.scalatest" %% "scalatest" % "3.0.5" % "test"
 
+libraryDependencies += "org.apache.commons" % "commons-math3" % "3.6.1"

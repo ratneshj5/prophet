@@ -4,6 +4,7 @@ import java.util.concurrent.TimeUnit
 
 import com.cibo.scalastan.RunMethod.OptimizeAlgorithm
 import com.cibo.scalastan.{RunMethod, StanResults}
+import org.apache.commons.math3.distribution.{LaplaceDistribution, NormalDistribution, PoissonDistribution}
 import org.nd4j.linalg.api.buffer.DataBuffer.Type
 import org.nd4j.linalg.api.ndarray.INDArray
 import org.nd4j.linalg.api.ops.impl.indexaccum.IMin
@@ -291,7 +292,7 @@ class Prophet(growth: String = "linear",
     *               df must also have a key cap that specifies the capacity at
     *               each ds.
     */
-  def predict(events: Map[String, INDArray]): mutable.Map[String, INDArray] = {
+  def predict(events: Map[String, INDArray]): Map[String, INDArray] = {
     var toPredict: collection.mutable.Map[String, INDArray] = mutable.Map.empty
 
     if (events.isEmpty) {
@@ -303,7 +304,8 @@ class Prophet(growth: String = "linear",
     toPredict("trend") = predict_trend(toPredict)
     toPredict = predict_seasonal_components(toPredict)
     toPredict("yhat") = toPredict("trend").mul(toPredict("multiplicative_terms").add(1)).add(toPredict("additive_terms"))
-    toPredict
+    toPredict ++= predictUncertainty(toPredict)
+    toPredict.toMap
   }
 
   /**
@@ -560,6 +562,126 @@ class Prophet(growth: String = "linear",
       throw new RuntimeException("mode must be 'additive' or 'multiplicative'")
     seasonalities = seasonalities :+ Seasonality(name, period, fourier_order, ps, md)
     this
+  }
+
+  private def predictUncertainty(events: mutable.Map[String, INDArray]): mutable.Map[String, INDArray] = {
+    val simValues = samplePosteriorPredictive(events)
+    val lowerP = 100 * (1.0 - intervalWidth) / 2
+    val upperP = 100 * (1.0 + intervalWidth) / 2
+
+    mutable.Map("yhat_lower" -> simValues("yhat").percentile(lowerP, 0), "yhat_upper" -> simValues("yhat").percentile(upperP, 0),
+      "trend_lower" -> simValues("trend").percentile(lowerP, 0), "trend_upper" -> simValues("trend").percentile(upperP, 0))
+  }
+
+  /**
+    * Prophet posterior\ predictive samples.
+    *
+    * @param events : Prediction map
+    *
+    *               Dictionary with posterior predictive samples for the forecast yhat and
+    *               for the trend component.
+    */
+  private def samplePosteriorPredictive(events: mutable.Map[String, INDArray]): Map[String, INDArray] = {
+
+    val nIterations = parameter.k.length()
+    val samplePerIter = Math.max(1, Math.ceil(uncertaintySamples / nIterations).toInt)
+
+    // Generate seasonality features once so we can re-use them.
+    val seasonalData = makeAllSeasonalityFeatures(events, seasonalities, regressors)
+    val yhat = zeros(events("t").length(), nIterations * samplePerIter)
+    val trend = zeros(events("t").length(), nIterations * samplePerIter)
+
+    (0 until nIterations).foreach(i => {
+      (0 until samplePerIter).foreach(j => {
+        val sampleEvents = sampleModel(events, seasonalData, i)
+        yhat.putColumn(i * j + j, sampleEvents("yhat"))
+        trend.putColumn(i * j + j, sampleEvents("trend"))
+      })
+    })
+    Map("yhat" -> yhat, "trend" -> trend)
+  }
+
+  /**
+    * Simulate observations from the extrapolated generative model
+    *
+    * @param events       : Prediction map.
+    * @param seasonalData :  seasonal data.
+    * @param iteration    : Int sampling iteration to use parameters from.
+    * @return
+    */
+  private def sampleModel(events: mutable.Map[String, INDArray], seasonalData: SeasonalData, iteration: Int): mutable.Map[String, INDArray] = {
+
+    val trend = samplePredictiveTrend(events, iteration)
+    val beta = parameter.beta.getRow(iteration)
+
+    val beta_add = beta.mul(seasonalData.s_a)
+    val comp_add = seasonalData.seasonalFeatures.mmul(beta_add.transpose()).mul(y_scale)
+
+    val beta_mul = beta.mul(seasonalData.s_m)
+    val comp_mul = seasonalData.seasonalFeatures.mmul(beta_mul.transpose())
+
+    val sigma = parameter.sigma_obs.getDouble(iteration)
+    val noise = create(new NormalDistribution(0, sigma).sample(events("t").length()).map(a => a * y_scale)).transpose()
+
+    val toReturn: mutable.Map[String, INDArray] = mutable.Map.empty
+
+    toReturn("yhat") = trend.mul(comp_mul.add(1)).add(comp_add).add(noise)
+    toReturn("trend") = trend
+    toReturn
+  }
+
+  /**
+    * Simulate the trend using the extrapolated generative model.
+    *
+    * @param events    : Prediction Map.
+    * @param iteration : sampling iteration to use parameters from.
+    * @return Nd4J array of simulated trend over events("t").
+    */
+  private def samplePredictiveTrend(events: mutable.Map[String, INDArray], iteration: Int): INDArray = {
+    val k = parameter.k.getDouble(iteration)
+    val m = parameter.m.getDouble(iteration)
+    val deltas = parameter.delta.getRow(iteration)
+
+    val T = max(events("t")).getDouble(0)
+    // New changepoints from a Poisson process with rate S on [1, T]
+    var nChanges = 0
+    var newChangepoints: Option[INDArray] = None
+    var newDeltas: Option[INDArray] = None
+
+    if (T > 1) {
+      val S = changepoints.getOrElse(zeros(1, 1)).length()
+      val distribution = new PoissonDistribution(S * (T - 1))
+      nChanges = distribution.sample()
+    }
+    if (nChanges > 0) {
+      val r = scala.util.Random
+      val array: Seq[Double] = (for (i <- 1 to nChanges) yield 1 + r.nextDouble() * (T - 1)).toSeq
+      newChangepoints = Some(create(array.toArray[Double]))
+
+      // Get the empirical scale of the deltas, plus epsilon to avoid NaNs.
+      val lamda = mean(abs(deltas)).add(1e-8).getDouble(0)
+
+      // Sample deltas
+      val distribution = new LaplaceDistribution(0d, lamda)
+      newDeltas = Some(create(distribution.sample(nChanges)))
+    }
+
+    var mergedChangepoints = changePoints.get
+    var mergedDeltas = deltas
+
+    if (newChangepoints.nonEmpty) {
+      mergedChangepoints = concat(1, changePoints.get, newChangepoints.get)
+      mergedDeltas = concat(1, newDeltas.get, deltas)
+    }
+
+    var trend: Option[INDArray] = None
+    if (growth == "linear") {
+      trend = Some(piecewise_linear(events("t"), mergedDeltas, k, m, mergedChangepoints))
+    } else {
+      trend = Some(piecewise_logistic(events("t"), events("cap"), mergedDeltas, k, m, mergedChangepoints))
+    }
+
+    trend.get.mul(y_scale).add(events("floor")).transpose()
   }
 
   /*

@@ -10,11 +10,12 @@ import org.scalatest.FunSuite
   */
 class TestProphet extends FunSuite {
   val dummy = Prophet()
-  val data: Seq[Double] = source.read(dummy.y, "y")
-  val ds: Seq[Double] = source.read(dummy.t, "ds")
   private val path: String = getClass.getResource("/data/data.csv").getPath
   private val source = com.cibo.scalastan.data.CsvDataSource.fromFile(path)
+  private val data: Seq[Double] = source.read(dummy.y, "y")
+  private val ds: Seq[Double] = source.read(dummy.t, "ds")
   private val length: Int = data.length
+
 
   test("Prophet.fitPredict") {
     val history: Map[String, INDArray] = Map("y" -> Nd4j.create(data.slice(0, length / 2).toArray), "ds" -> Nd4j.create(ds.slice(0, length / 2).toArray))
