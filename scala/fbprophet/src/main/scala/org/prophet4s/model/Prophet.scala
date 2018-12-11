@@ -2,7 +2,7 @@ package org.prophet4s.model
 
 import java.util.concurrent.TimeUnit
 
-import com.cibo.scalastan.RunMethod.OptimizeAlgorithm
+import com.cibo.scalastan.RunMethod.{Method, OptimizeAlgorithm}
 import com.cibo.scalastan.{RunMethod, StanResults}
 import org.apache.commons.math3.distribution.{LaplaceDistribution, NormalDistribution, PoissonDistribution}
 import org.nd4j.linalg.api.buffer.DataBuffer.Type
@@ -60,9 +60,9 @@ class Prophet(growth: String = "linear",
               changepoints: Option[INDArray] = None,
               nChangepoints: Int = 25,
               changePointRange: Double = 0.8,
-              yearlySeasonality: Any = "auto",
-              weeklySeasonality: Any = "auto",
-              dailySeasonality: Any = "auto",
+              val yearlySeasonality: Any = "auto",
+              val weeklySeasonality: Any = "auto",
+              val dailySeasonality: Any = "auto",
               seasonalityMode: String = "additive",
               seasonalityPriorScale: Double = 10.0,
               changePointPriorScale: Double = 0.05,
@@ -71,21 +71,21 @@ class Prophet(growth: String = "linear",
               uncertaintySamples: Int = 1000 // Capacities for logistic trend
              ) extends ProphetModel {
   Nd4j.setDataType(Type.DOUBLE)
-  private var changePoints: Option[INDArray] = changepoints
-  private var nChangePoints = if (changePoints.isEmpty) nChangepoints else changepoints.get.length()
+  var changePoints: Option[INDArray] = changepoints
+  var nChangePoints: Int = if (changePoints.isEmpty) nChangepoints else changepoints.get.length()
 
   validate_inputs()
-  private var seasonalities: mutable.Seq[Seasonality] = mutable.Seq.empty
+  var seasonalities: mutable.Seq[Seasonality] = mutable.Seq.empty
   private var regressors: mutable.Seq[Regressor] = mutable.Seq.empty
 
-  // Set during fitting
-  private var history: collection.mutable.Map[String, INDArray] = mutable.Map.empty
+  // Set during regularize
+  var history: collection.mutable.Map[String, INDArray] = mutable.Map.empty
   private var start: Double = 0
-  private var y_scale: Double = 0
-  private var logistic_floor: Boolean = false
-  private var t_scale: Double = 0
+  private var yScale: Double = 0
+  var logisticFloor: Boolean = false
+  private var tScale: Double = 0
 
-  private val doubles = new Array[Double](1)
+
   //Set during fitting
   private var parameter: Parameter = Parameter(create(Array(0d)), create(Array(0d)),
     create(1, 1), create(Array(0d)), create(1, 1))
@@ -107,11 +107,12 @@ class Prophet(growth: String = "linear",
     *               type) and y, the time series. If growth is 'logistic', then
     *               df must also have a key cap that specifies the capacity at
     *               each ds.
+    * @param method : RunMethod to be used
     * @return
     * The fitted Prophet object.
     */
 
-  def fit(events: Map[String, INDArray]): Prophet = {
+  def fit(events: Map[String, INDArray], method: Option[Method] = None): Prophet = {
 
     if (!events.contains("y") || !events.contains("ds"))
       throw new RuntimeException("History must have keys 'ds' and 'y' with the dates and values respectively")
@@ -122,12 +123,12 @@ class Prophet(growth: String = "linear",
 
     history ++= events
     if (history("y").length < 2) throw new RuntimeException("events has less than 2 non-NaN rows.")
-    history = setup_history(history, initialize_scales = true)
+    history = prepare(history, initializeScales = true)
     setAutoSeasonalities()
     val seasonalData = makeAllSeasonalityFeatures(history, seasonalities, regressors)
     setChangePoints()
     val nSeasonalFeatures = seasonalData.prior_scales.length
-    parameter = init_param(history, growth, changePoints.get.length(), nSeasonalFeatures)
+    parameter = initParam(history, growth, changePoints.get.length(), nSeasonalFeatures)
     val yData: Seq[Double] = history("y_scaled").data().asDouble()
     val deltaData: Seq[Double] = parameter.delta.data().asDouble().toSeq
     val betaData: Seq[Double] = parameter.beta.data().asDouble().toSeq
@@ -152,23 +153,27 @@ class Prophet(growth: String = "linear",
       .withData(s_a, seasonalData.s_a.data().asDouble().toSeq)
       .withData(s_m, seasonalData.s_m.data().asDouble().toSeq)
 
-    if (growth == "linear" && max(history("y")).getDouble(0) == min(history("y_scaled")).getDouble(0)) {
+    if (growth == "linear" && max(history("y")).getDouble(0) == min(history("y")).getDouble(0)) {
       parameter = Parameter(parameter.k, parameter.m, parameter.delta, create(Array(Math.pow(10, -9))), parameter.beta)
-    } else if (mcmcSamples > 0) {
+    } else if (method.nonEmpty) {
+      val results = model.run(cache = false, method = method.get)
+      parameter = extractParams(results)
+    }
+    else if (mcmcSamples > 0) {
       val results = model.run(cache = false, method = RunMethod.Sample(samples = mcmcSamples))
-      parameter = extract_params(results)
+      parameter = extractParams(results)
     } else {
       try {
         val results = model.run(cache = false, method = RunMethod.Optimize(iter = 10000))
-        parameter = extract_params(results)
+        parameter = extractParams(results)
       } catch {
         case _: Exception =>
           val results = model.run(cache = false, method = RunMethod.Optimize(iter = 10000, algorithm = Newton()))
-          parameter = extract_params(results)
+          parameter = extractParams(results)
       }
     }
 
-    def extract_params(results: StanResults): Parameter = {
+    def extractParams(results: StanResults): Parameter = {
       val _k = create(results.samples(k).apply(results.bestChain).toArray[Double])
       val _m = create(results.samples(m).apply(results.bestChain).toArray[Double])
       val _delta = create(results.samples(delta).apply(results.bestChain).map(a => a.toArray[Double]).toArray)
@@ -246,13 +251,13 @@ class Prophet(growth: String = "linear",
     fourierOrder
   }
 
-  private def setChangePoints(): Unit = {
+  def setChangePoints(): Unit = {
     val typedDS = history("ds")
     if (changePoints.nonEmpty) {
       val tooLow = min(changePoints.get).getDouble(0) < min(typedDS).getDouble(0)
       val tooHigh = max(changePoints.get).getDouble(0) < max(typedDS).getDouble(0)
       if (tooHigh || tooLow)
-        throw new RuntimeException("Changepoints must fall within training data")
+        throw new UnsupportedOperationException("Changepoints must fall within training data")
     } else {
       val historySize = Math.floor(typedDS.length * changePointRange).toInt
       if (nChangePoints + 1 > historySize) {
@@ -261,13 +266,13 @@ class Prophet(growth: String = "linear",
       }
 
       if (nChangePoints > 0) {
-        val indexes: Stream[Int] = linspace(0, historySize - 1, nChangePoints)
-        changePoints = scala.Some(zeros(nChangepoints))
+        val indexes: Stream[Int] = linspace(0, historySize, nChangePoints)
+        changePoints = scala.Some(zeros(nChangePoints))
         indexes.zipWithIndex.foreach(index => changePoints.get.put(index._2, create(Array.fill(1)(typedDS.getDouble(index._1)))))
       }
 
       if (changePoints.nonEmpty)
-        changePoints = Some(changePoints.get.sub(start).div(t_scale))
+        changePoints = Some(changePoints.get.sub(start).div(tScale))
       else {
         changePoints = scala.Some(zeros(1))
         nChangePoints = 1
@@ -299,10 +304,10 @@ class Prophet(growth: String = "linear",
       toPredict ++= history
     } else {
       toPredict ++= events
-      toPredict = setup_history(toPredict)
+      toPredict = prepare(toPredict)
     }
-    toPredict("trend") = predict_trend(toPredict)
-    toPredict = predict_seasonal_components(toPredict)
+    toPredict("trend") = predictTrend(toPredict)
+    toPredict = predictSeasonalComponents(toPredict)
     toPredict("yhat") = toPredict("trend").mul(toPredict("multiplicative_terms").add(1)).add(toPredict("additive_terms"))
     toPredict ++= predictUncertainty(toPredict)
     toPredict.toMap
@@ -313,7 +318,7 @@ class Prophet(growth: String = "linear",
     * @param events : Map with ds, t,y_scaled, and cap_scaled if logistic growth.
     * @return
     */
-  private def predict_trend(events: mutable.Map[String, INDArray]): INDArray = {
+  private def predictTrend(events: mutable.Map[String, INDArray]): INDArray = {
 
     val t: INDArray = events("t")
     val k: Double = mean(parameter.k, 0).getDouble(0)
@@ -322,22 +327,22 @@ class Prophet(growth: String = "linear",
 
     var trend: INDArray = zeros(1, 1)
     if (growth == "linear") {
-      trend = piecewise_linear(t, deltas, k, m, changePoints.get)
+      trend = piecewiseLinear(t, deltas, k, m, changePoints.get)
     }
     else {
-      trend = piecewise_logistic(t, events("cap_scaled"), deltas, k, m, changePoints.get)
+      trend = piecewiseLogistic(t, events("cap_scaled"), deltas, k, m, changePoints.get)
     }
-    trend.mul(y_scale).add(events("floor")).transpose()
+    trend.mul(yScale).add(events("floor")).transpose()
   }
 
-  private def predict_seasonal_components(events: mutable.Map[String, INDArray]): mutable.Map[String, INDArray] = {
+  private def predictSeasonalComponents(events: mutable.Map[String, INDArray]): mutable.Map[String, INDArray] = {
 
     val seasonalData: SeasonalData = makeAllSeasonalityFeatures(events, seasonalities, regressors)
     val lower_p = 100 * (1.0 - intervalWidth) / 2
     val upper_p = 100 * (1.0 + intervalWidth) / 2
 
     val beta_add = parameter.beta.mul(seasonalData.s_a)
-    val comp_add = seasonalData.seasonalFeatures.mmul(beta_add.transpose()).mul(y_scale)
+    val comp_add = seasonalData.seasonalFeatures.mmul(beta_add.transpose()).mul(yScale)
     events.put("additive_terms", mean(comp_add, 1))
     if (comp_add.columns() == 1) {
       events.put("additive_terms_lower", comp_add)
@@ -366,12 +371,12 @@ class Prophet(growth: String = "linear",
     * 'y_scaled', and 'cap_scaled'. These columns are used during both
     * fitting and predicting.
     *
-    * @param events            : Map with ds, y, and cap if logistic growth. Any
-    *                          specified additional regressors must also be present.
-    * @param initialize_scales Boolean set scaling factors in self from events
+    * @param events           : Map with ds, y, and cap if logistic growth. Any
+    *                         specified additional regressors must also be present.
+    * @param initializeScales Boolean set scaling factors in self from events
     */
-  private def setup_history(events: mutable.Map[String, INDArray],
-                            initialize_scales: Boolean = false): mutable.Map[String, INDArray] = {
+  def prepare(events: mutable.Map[String, INDArray],
+              initializeScales: Boolean = false): mutable.Map[String, INDArray] = {
 
     // TODO: Add different timestamps support, assuming long for now
     // TODO: Add timestamps sort support, assuming sorted for now
@@ -379,14 +384,13 @@ class Prophet(growth: String = "linear",
     regressors.foreach(regressor => if (!events.contains(regressor.name)) {
       throw new RuntimeException(s"Regressor ${regressor.name} missing from events")
     })
-    initializeScales(events, initialize_scales)
+    initialiseScales(events, initializeScales)
 
-    if (logistic_floor) {
+    if (logisticFloor) {
       if (!events.contains("floor"))
         throw new RuntimeException("Expected column 'floor'.")
     }
     else events("floor") = zeros(events("ds").length)
-    val typedY = events("y")
 
     val floor = events("floor")
 
@@ -394,14 +398,14 @@ class Prophet(growth: String = "linear",
       if (!events.contains("cap"))
         throw new RuntimeException("Capacities must be supplied for logistic growth in column 'cap'")
       val typedCap = events("cap")
-      events.put("cap_scaled", typedCap.sub(floor).div(y_scale))
+      events.put("cap_scaled", typedCap.sub(floor).div(yScale))
     } else {
       events.put("cap_scaled", zeros(events("ds").length))
     }
 
-    events.put("t", events("ds").sub(start).div(t_scale))
+    events.put("t", events("ds").sub(start).div(tScale))
     if (events.contains("y"))
-      events.put("y_scaled", typedY.sub(floor).div(y_scale))
+      events.put("y_scaled", events("y").sub(floor).div(yScale))
 
     regressors.foreach(
       regressor => {
@@ -419,7 +423,7 @@ class Prophet(growth: String = "linear",
     * @param initialize_scales : Boolean set scaling factors in self from events
     */
 
-  private def initializeScales(events: mutable.Map[String, INDArray],
+  private def initialiseScales(events: mutable.Map[String, INDArray],
                                initialize_scales: Boolean): Unit = {
     if (!initialize_scales) return
     val typedDS = events("ds")
@@ -427,14 +431,14 @@ class Prophet(growth: String = "linear",
     val typedY = events("y")
 
     if (growth == "logistic" && events.contains("floor")) {
-      logistic_floor = true
+      logisticFloor = true
       floor = events("floor")
     }
-    y_scale = max(abs(typedY.sub(floor))).getDouble(0)
-    if (y_scale == 0d) y_scale = 1d
+    yScale = max(abs(typedY.sub(floor))).getDouble(0)
+    if (yScale == 0d) yScale = 1d
 
     start = min(typedDS).getDouble(0)
-    t_scale = max(typedDS).getDouble(0) - start
+    tScale = max(typedDS).getDouble(0) - start
 
     regressors.foreach(
       regressor => {
@@ -477,10 +481,10 @@ class Prophet(growth: String = "linear",
     *             self.seasonality_mode.
     */
 
-  def add_regressor(name: String, standardize: Option[Boolean],
-                    priorScale: Option[Double] = None, mode: Option[String] = None): Prophet = {
+  def addRegressor(name: String, standardize: Option[Boolean],
+                   priorScale: Option[Double] = None, mode: Option[String] = None): Prophet = {
     if (history.nonEmpty) throw new RuntimeException("Regressors must be added prior to model fitting.")
-    validate_column_name(name, check_regressors = false)
+    validateColumnName(name, check_regressors = false)
     val ps = priorScale.getOrElse(seasonalityPriorScale)
     if (ps <= 0) throw new RuntimeException("Prior scale must be >0")
 
@@ -499,8 +503,8 @@ class Prophet(growth: String = "linear",
     * @param check_regressors    :Boolean, check if name already used for regressor
     * @return
     */
-  private def validate_column_name(name: String, check_holidays: Boolean = true,
-                                   check_seasonalities: Boolean = true, check_regressors: Boolean = true): Unit = {
+  private def validateColumnName(name: String, check_holidays: Boolean = true,
+                                 check_seasonalities: Boolean = true, check_regressors: Boolean = true): Unit = {
 
     if (name.contains('_delim_)) throw new RuntimeException("Name cannot contain '_delim_'")
     var reserved_names = Seq("trend", "additive_terms", "daily", "weekly", "yearly", "holidays",
@@ -510,13 +514,13 @@ class Prophet(growth: String = "linear",
     val rn_u = reserved_names.map(a => a + "_upper")
     reserved_names = reserved_names ++ rn_l ++ rn_u
     if (reserved_names.contains(name)) {
-      throw new RuntimeException(s"Name  $name  is reserved")
+      throw new UnsupportedOperationException(s"Name  $name  is reserved")
     }
     if (check_seasonalities && seasonalities.map(s => s.name).contains(name))
-      throw new RuntimeException(s"Name $name is already used for a seasonality")
+      throw new UnsupportedOperationException(s"Name $name is already used for a seasonality")
 
     if (check_regressors && regressors.map(s => s.name).contains(name))
-      throw new RuntimeException(s"Name $name is already used for a regressor")
+      throw new UnsupportedOperationException(s"Name $name is already used for a regressor")
   }
 
   /**
@@ -545,21 +549,21 @@ class Prophet(growth: String = "linear",
     */
 
 
-  def add_seasonality(name: String, period: Double, fourier_order: Int,
-                      prior_scale: Option[Double] = None, mode: Option[String] = None): Prophet = {
+  def addSeasonality(name: String, period: Double, fourier_order: Int,
+                     prior_scale: Option[Double] = None, mode: Option[String] = None): Prophet = {
 
     if (history.nonEmpty)
       throw new RuntimeException("Seasonality must be added prior to model fitting.")
     if (!Seq("daily", "weekly", "yearly").contains(name)) {
       // Allow overwriting built-in seasonalities
-      validate_column_name(name, check_seasonalities = false)
+      validateColumnName(name, check_seasonalities = false)
     }
     val ps = prior_scale.getOrElse(seasonalityPriorScale)
-    if (ps <= 0) throw new RuntimeException("Prior scale must be >0")
+    if (ps <= 0) throw new UnsupportedOperationException("Prior scale must be >0")
 
     val md = mode.getOrElse(seasonalityMode)
     if (!Seq("additive", "multiplicative").contains(md))
-      throw new RuntimeException("mode must be 'additive' or 'multiplicative'")
+      throw new UnsupportedOperationException("mode must be 'additive' or 'multiplicative'")
     seasonalities = seasonalities :+ Seasonality(name, period, fourier_order, ps, md)
     this
   }
@@ -615,13 +619,13 @@ class Prophet(growth: String = "linear",
     val beta = parameter.beta.getRow(iteration)
 
     val beta_add = beta.mul(seasonalData.s_a)
-    val comp_add = seasonalData.seasonalFeatures.mmul(beta_add.transpose()).mul(y_scale)
+    val comp_add = seasonalData.seasonalFeatures.mmul(beta_add.transpose()).mul(yScale)
 
     val beta_mul = beta.mul(seasonalData.s_m)
     val comp_mul = seasonalData.seasonalFeatures.mmul(beta_mul.transpose())
 
     val sigma = parameter.sigma_obs.getDouble(iteration)
-    val noise = create(new NormalDistribution(0, sigma).sample(events("t").length()).map(a => a * y_scale)).transpose()
+    val noise = create(new NormalDistribution(0, sigma).sample(events("t").length()).map(a => a * yScale)).transpose()
 
     val toReturn: mutable.Map[String, INDArray] = mutable.Map.empty
 
@@ -655,8 +659,8 @@ class Prophet(growth: String = "linear",
     }
     if (nChanges > 0) {
       val r = scala.util.Random
-      val array: Seq[Double] = (for (i <- 1 to nChanges) yield 1 + r.nextDouble() * (T - 1)).toSeq
-      newChangepoints = Some(create(array.toArray[Double]))
+      val newChangepointsSeq: Seq[Double] = for (i <- 1 to nChanges) yield 1 + r.nextDouble() * (T - 1)
+      newChangepoints = Some(create(newChangepointsSeq.toArray[Double]))
 
       // Get the empirical scale of the deltas, plus epsilon to avoid NaNs.
       val lamda = mean(abs(deltas)).add(1e-8).getDouble(0)
@@ -676,12 +680,12 @@ class Prophet(growth: String = "linear",
 
     var trend: Option[INDArray] = None
     if (growth == "linear") {
-      trend = Some(piecewise_linear(events("t"), mergedDeltas, k, m, mergedChangepoints))
+      trend = Some(piecewiseLinear(events("t"), mergedDeltas, k, m, mergedChangepoints))
     } else {
-      trend = Some(piecewise_logistic(events("t"), events("cap"), mergedDeltas, k, m, mergedChangepoints))
+      trend = Some(piecewiseLogistic(events("t"), events("cap"), mergedDeltas, k, m, mergedChangepoints))
     }
 
-    trend.get.mul(y_scale).add(events("floor")).transpose()
+    trend.get.mul(yScale).add(events("floor")).transpose()
   }
 
   /*
@@ -689,13 +693,13 @@ class Prophet(growth: String = "linear",
    */
   private def validate_inputs() {
     if (!(growth == "linear" || growth == "logistic")) {
-      throw new RuntimeException("Parameter 'growth' should be 'linear' or 'logistic'.")
+      throw new UnsupportedOperationException("Parameter 'growth' should be 'linear' or 'logistic'.")
     }
     if ((changePointRange < 0) || (changePointRange > 1)) {
-      throw new RuntimeException("Parameter 'changePointRange' must be in [0, 1]")
+      throw new UnsupportedOperationException("Parameter 'changePointRange' must be in [0, 1]")
     }
     if (!(seasonalityMode == "additive" || seasonalityMode == "multiplicative")) {
-      throw new RuntimeException("seasonalityMode must be 'additive' or 'multiplicative'")
+      throw new UnsupportedOperationException("seasonalityMode must be 'additive' or 'multiplicative'")
     }
   }
 }
@@ -714,7 +718,7 @@ object Prophet {
             changePointPriorScale: Double = 0.05,
             mcmcSamples: Int = 0,
             intervalWidth: Double = 0.80, // Number of regressors
-            uncertaintySamples: Int = 1000 // Capacities for logistic trend
+            uncertaintySamples: Int = 1000 // Capacities for logistic trend,
            ): Prophet =
     new Prophet(growth, changePoints, nChangePoints, changePointRange,
       yearlySeasonality, weeklySeasonality, dailySeasonality
@@ -730,7 +734,7 @@ object Prophet {
     * @param nSeasonalFeatures : number of seasonal features
     * @return Initialized Parameter
     */
-  private def init_param(events: mutable.Map[String, INDArray], growth: String, nChangepoint: Int, nSeasonalFeatures: Int): Parameter = {
+  def initParam(events: mutable.Map[String, INDArray], growth: String, nChangepoint: Int, nSeasonalFeatures: Int): Parameter = {
     val ds = events("ds")
     val time = events("t")
     val yScaled = events("y_scaled")
@@ -765,17 +769,13 @@ object Prophet {
     }
   }
 
-  private def getDoubleSequence(any: Stream[Any]): Stream[Double] = {
-    any.map(a => a.asInstanceOf[Double])
-  }
-
   /**
     *
     * @param t            : Stream containing epochs
     * @param changePoints : List of epochs at which to include potential changepoints.
     * @return Stream containing linear prediction
     */
-  private def piecewise_linear(t: INDArray, deltas: INDArray, k: Double, m: Double, changePoints: INDArray): INDArray = {
+  def piecewiseLinear(t: INDArray, deltas: INDArray, k: Double, m: Double, changePoints: INDArray): INDArray = {
 
     // Intercept changes
     val gammas = changePoints.mul(deltas).mul(-1)
@@ -800,19 +800,19 @@ object Prophet {
     * @param cap          : logistic cap stream
     * @return
     */
-  private def piecewise_logistic(t: INDArray, cap: INDArray, deltas: INDArray, k: Double, m: Double, changePoints: INDArray): INDArray = {
+  def piecewiseLogistic(t: INDArray, cap: INDArray, deltas: INDArray, k: Double, m: Double, changePoints: INDArray): INDArray = {
 
     // Intercept changes
-    val kCumulative = concat(0, create(Array.fill(1)(k)), deltas.cumsum(0).add(k))
+    val kCumulative = concat(0, create(Array.fill(changePoints.length())(k)), deltas.cumsum(0).add(k))
     val gammas = create(Array.fill(changePoints.length)(0d))
 
     (0 until changePoints.length()).foreach(s => {
       val value = (changePoints.getDouble(s) - m - sum(gammas, 0).getDouble(0)) *
         (1 - (kCumulative.getDouble(s) / kCumulative.getDouble(s + 1)))
-      gammas.put(s, create(Array(x = value)))
+      gammas.put(s, create(Array(value)))
     })
-    val k_t = create(Array.fill(t.length())(1d)).mul(k)
-    val m_t = create(Array.fill(t.length())(1d)).mul(m)
+    val k_t = create(Array.fill(t.length())(k))
+    val m_t = create(Array.fill(t.length())(m))
 
     (0 until changePoints.length()).foreach(s => {
       (0 until t.length()).foreach(t1 => {
@@ -822,7 +822,7 @@ object Prophet {
         }
       })
     })
-    cap.div(exp(k_t.mul(t).add(m_t).mul(-1)))
+    cap.div(exp(k_t.mul(t.sub(m_t)).mul(-1)).add(1))
   }
 
   private def makeAllSeasonalityFeatures(events: mutable.Map[String, INDArray],
@@ -880,7 +880,7 @@ object Prophet {
     */
   private def makeSeasonalityFeatures(t: INDArray,
                                       seasonality: Seasonality): INDArray = {
-    fourier_series(t, seasonality.period, seasonality.fourierOrder)
+    fourierSeries(t, seasonality.period, seasonality.fourierOrder)
   }
 
   /**
@@ -891,10 +891,9 @@ object Prophet {
     * @param period       :  Number of days of the period.
     * @param series_order : Number of components.
     */
-  private def fourier_series(t: INDArray, period: Double, series_order: Int): INDArray = {
+  def fourierSeries(t: INDArray, period: Double, series_order: Int): INDArray = {
     val toReturn = zeros(t.length(), 2 * series_order)
 
-    //    sin(t.div(3600 * 24 * 1000).mul(2*(i/2+1)).mul(math.Pi).div(period)
     (0 until t.length()).map(t1 => {
       (0 to (2 * (series_order - 1)) + 1).map(i => {
         if (i % 2 == 0) {
