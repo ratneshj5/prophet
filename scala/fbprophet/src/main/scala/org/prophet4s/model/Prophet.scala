@@ -10,6 +10,7 @@ import org.nd4j.linalg.api.ndarray.INDArray
 import org.nd4j.linalg.api.ops.impl.indexaccum.IMin
 import org.nd4j.linalg.factory.Nd4j
 import org.nd4j.linalg.factory.Nd4j._
+import org.nd4j.linalg.indexing.conditions.GreaterThan
 import org.nd4j.linalg.ops.transforms.Transforms.{abs, exp}
 import org.prophet4s.domain.Domain
 import org.prophet4s.domain.Domain.{Parameter, Regressor, SeasonalData, Seasonality}
@@ -783,12 +784,9 @@ object Prophet {
     val m_t = create(Array.fill(t.length())(1d)).mul(m)
 
     (0 until changePoints.length()).foreach(s => {
-      (0 until t.length()).foreach(t1 => {
-        if (t.getDouble(t1) > changePoints.getDouble(s)) {
-          k_t.put(t1, k_t.getColumn(t1).add(deltas.getColumn(s)))
-          m_t.put(t1, m_t.getColumn(t1).add(gammas.getColumn(s)))
-        }
-      })
+      val indexes = t.cond(new GreaterThan(changePoints.getDouble(s)))
+      k_t.addi(indexes.mul(deltas.getColumn(s)))
+      m_t.addi(indexes.mul(gammas.getColumn(s)))
     })
     k_t.mul(t).add(m_t)
   }
