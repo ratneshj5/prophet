@@ -17,7 +17,7 @@ import org.prophet4s.domain.Domain.{Parameter, Regressor, SeasonalData, Seasonal
 import org.prophet4s.model.Prophet._
 import org.prophet4s.stan.ProphetModel
 
-import scala.collection.mutable
+import scala.collection.parallel.mutable.{ParMap, ParSeq}
 
 /**
   * Prophet forecaster.
@@ -76,11 +76,11 @@ class Prophet(growth: String = "linear",
   var nChangePoints: Int = if (changePoints.isEmpty) nChangepoints else changepoints.get.length()
 
   validate_inputs()
-  var seasonalities: mutable.Seq[Seasonality] = mutable.Seq.empty
-  private var regressors: mutable.Seq[Regressor] = mutable.Seq.empty
+  var seasonalities: ParSeq[Seasonality] = ParSeq.empty
+  private var regressors: ParSeq[Regressor] = ParSeq.empty
 
   // Set during regularize
-  var history: collection.mutable.Map[String, INDArray] = mutable.Map.empty
+  var history: ParMap[String, INDArray] = ParMap.empty
   private var start: Double = 0
   private var yScale: Double = 0
   var logisticFloor: Boolean = false
@@ -299,19 +299,22 @@ class Prophet(growth: String = "linear",
     *               each ds.
     */
   def predict(events: Map[String, INDArray]): Map[String, INDArray] = {
-    var toPredict: collection.mutable.Map[String, INDArray] = mutable.Map.empty
+    var toPredict: ParMap[String, INDArray] = ParMap.empty
 
     if (events.isEmpty) {
-      toPredict ++= history
+      toPredict = history
     } else {
       toPredict ++= events
       toPredict = prepare(toPredict)
     }
-    toPredict("trend") = predictTrend(toPredict)
+
+    toPredict.put("trend", predictTrend(toPredict))
     toPredict = predictSeasonalComponents(toPredict)
-    toPredict("yhat") = toPredict("trend").mul(toPredict("multiplicative_terms").add(1)).add(toPredict("additive_terms"))
-    toPredict ++= predictUncertainty(toPredict)
-    toPredict.toMap
+    toPredict.put("yhat", toPredict("trend").mul(toPredict("multiplicative_terms").add(1)).add(toPredict("additive_terms")))
+
+    toPredict = toPredict ++ predictUncertainty(toPredict)
+
+    toPredict.toStream.toMap
   }
 
   /**
@@ -319,7 +322,7 @@ class Prophet(growth: String = "linear",
     * @param events : Map with ds, t,y_scaled, and cap_scaled if logistic growth.
     * @return
     */
-  private def predictTrend(events: mutable.Map[String, INDArray]): INDArray = {
+  private def predictTrend(events: ParMap[String, INDArray]): INDArray = {
 
     val t: INDArray = events("t")
     val k: Double = mean(parameter.k, 0).getDouble(0)
@@ -336,7 +339,7 @@ class Prophet(growth: String = "linear",
     trend.mul(yScale).add(events("floor")).transpose()
   }
 
-  private def predictSeasonalComponents(events: mutable.Map[String, INDArray]): mutable.Map[String, INDArray] = {
+  private def predictSeasonalComponents(events: ParMap[String, INDArray]): ParMap[String, INDArray] = {
 
     val seasonalData: SeasonalData = makeAllSeasonalityFeatures(events, seasonalities, regressors)
     val lower_p = 100 * (1.0 - intervalWidth) / 2
@@ -376,8 +379,8 @@ class Prophet(growth: String = "linear",
     *                         specified additional regressors must also be present.
     * @param initializeScales Boolean set scaling factors in self from events
     */
-  def prepare(events: mutable.Map[String, INDArray],
-              initializeScales: Boolean = false): mutable.Map[String, INDArray] = {
+  def prepare(events: ParMap[String, INDArray],
+              initializeScales: Boolean = false): ParMap[String, INDArray] = {
 
     // TODO: Add different timestamps support, assuming long for now
     // TODO: Add timestamps sort support, assuming sorted for now
@@ -391,7 +394,7 @@ class Prophet(growth: String = "linear",
       if (!events.contains("floor"))
         throw new RuntimeException("Expected column 'floor'.")
     }
-    else events("floor") = zeros(events("ds").length)
+    else events.put("floor", zeros(events("ds").length))
 
     val floor = events("floor")
 
@@ -410,7 +413,7 @@ class Prophet(growth: String = "linear",
 
     regressors.foreach(
       regressor => {
-        events(regressor.name) = events(regressor.name).sub(regressor.mu).div(regressor.std)
+        events.put(regressor.name, events(regressor.name).sub(regressor.mu).div(regressor.std))
       }
     )
     events
@@ -424,7 +427,7 @@ class Prophet(growth: String = "linear",
     * @param initialize_scales : Boolean set scaling factors in self from events
     */
 
-  private def initialiseScales(events: mutable.Map[String, INDArray],
+  private def initialiseScales(events: ParMap[String, INDArray],
                                initialize_scales: Boolean): Unit = {
     if (!initialize_scales) return
     val typedDS = events("ds")
@@ -517,10 +520,10 @@ class Prophet(growth: String = "linear",
     if (reserved_names.contains(name)) {
       throw new UnsupportedOperationException(s"Name  $name  is reserved")
     }
-    if (check_seasonalities && seasonalities.map(s => s.name).contains(name))
+    if (check_seasonalities && seasonalities.map(s => s.name).toStream.contains(name))
       throw new UnsupportedOperationException(s"Name $name is already used for a seasonality")
 
-    if (check_regressors && regressors.map(s => s.name).contains(name))
+    if (check_regressors && regressors.map(s => s.name).toStream.contains(name))
       throw new UnsupportedOperationException(s"Name $name is already used for a regressor")
   }
 
@@ -569,12 +572,12 @@ class Prophet(growth: String = "linear",
     this
   }
 
-  private def predictUncertainty(events: mutable.Map[String, INDArray]): mutable.Map[String, INDArray] = {
+  private def predictUncertainty(events: ParMap[String, INDArray]): ParMap[String, INDArray] = {
     val simValues = samplePosteriorPredictive(events)
     val lowerP = 100 * (1.0 - intervalWidth) / 2
     val upperP = 100 * (1.0 + intervalWidth) / 2
 
-    mutable.Map("yhat_lower" -> simValues("yhat").percentile(lowerP, 0), "yhat_upper" -> simValues("yhat").percentile(upperP, 0),
+    ParMap("yhat_lower" -> simValues("yhat").percentile(lowerP, 0), "yhat_upper" -> simValues("yhat").percentile(upperP, 0),
       "trend_lower" -> simValues("trend").percentile(lowerP, 0), "trend_upper" -> simValues("trend").percentile(upperP, 0))
   }
 
@@ -586,7 +589,7 @@ class Prophet(growth: String = "linear",
     *               Dictionary with posterior predictive samples for the forecast yhat and
     *               for the trend component.
     */
-  private def samplePosteriorPredictive(events: mutable.Map[String, INDArray]): Map[String, INDArray] = {
+  private def samplePosteriorPredictive(events: ParMap[String, INDArray]): Map[String, INDArray] = {
 
     val nIterations = parameter.k.length()
     val samplePerIter = Math.max(1, Math.ceil(uncertaintySamples / nIterations).toInt)
@@ -596,8 +599,8 @@ class Prophet(growth: String = "linear",
     val yhat = zeros(events("t").length(), nIterations * samplePerIter)
     val trend = zeros(events("t").length(), nIterations * samplePerIter)
 
-    (0 until nIterations).foreach(i => {
-      (0 until samplePerIter).foreach(j => {
+    (0 until nIterations).par.foreach(i => {
+      (0 until samplePerIter).par.foreach(j => {
         val sampleEvents = sampleModel(events, seasonalData, i)
         yhat.putColumn(i * j + j, sampleEvents("yhat"))
         trend.putColumn(i * j + j, sampleEvents("trend"))
@@ -614,7 +617,7 @@ class Prophet(growth: String = "linear",
     * @param iteration    : Int sampling iteration to use parameters from.
     * @return
     */
-  private def sampleModel(events: mutable.Map[String, INDArray], seasonalData: SeasonalData, iteration: Int): mutable.Map[String, INDArray] = {
+  private def sampleModel(events: ParMap[String, INDArray], seasonalData: SeasonalData, iteration: Int): ParMap[String, INDArray] = {
 
     val trend = samplePredictiveTrend(events, iteration)
     val beta = parameter.beta.getRow(iteration)
@@ -628,10 +631,10 @@ class Prophet(growth: String = "linear",
     val sigma = parameter.sigma_obs.getDouble(iteration)
     val noise = create(new NormalDistribution(0, sigma).sample(events("t").length()).map(a => a * yScale)).transpose()
 
-    val toReturn: mutable.Map[String, INDArray] = mutable.Map.empty
+    val toReturn: ParMap[String, INDArray] = ParMap.empty
 
-    toReturn("yhat") = trend.mul(comp_mul.add(1)).add(comp_add).add(noise)
-    toReturn("trend") = trend
+    toReturn.put("yhat", trend.mul(comp_mul.add(1)).add(comp_add).add(noise))
+    toReturn.put("trend", trend)
     toReturn
   }
 
@@ -642,7 +645,7 @@ class Prophet(growth: String = "linear",
     * @param iteration : sampling iteration to use parameters from.
     * @return Nd4J array of simulated trend over events("t").
     */
-  private def samplePredictiveTrend(events: mutable.Map[String, INDArray], iteration: Int): INDArray = {
+  private def samplePredictiveTrend(events: ParMap[String, INDArray], iteration: Int): INDArray = {
     val k = parameter.k.getDouble(iteration)
     val m = parameter.m.getDouble(iteration)
     val deltas = parameter.delta.getRow(iteration)
@@ -735,7 +738,7 @@ object Prophet {
     * @param nSeasonalFeatures : number of seasonal features
     * @return Initialized Parameter
     */
-  def initParam(events: mutable.Map[String, INDArray], growth: String, nChangepoint: Int, nSeasonalFeatures: Int): Parameter = {
+  def initParam(events: ParMap[String, INDArray], growth: String, nChangepoint: Int, nSeasonalFeatures: Int): Parameter = {
     val ds = events("ds")
     val time = events("t")
     val yScaled = events("y_scaled")
@@ -780,10 +783,10 @@ object Prophet {
 
     // Intercept changes
     val gammas = changePoints.mul(deltas).mul(-1)
-    val k_t = create(Array.fill(t.length())(1d)).mul(k)
-    val m_t = create(Array.fill(t.length())(1d)).mul(m)
+    val k_t = create(Array.fill(t.length())(k))
+    val m_t = create(Array.fill(t.length())(m))
 
-    (0 until changePoints.length()).foreach(s => {
+    (0 until changePoints.length()).par.foreach(s => {
       val indexes = t.cond(new GreaterThan(changePoints.getDouble(s)))
       k_t.addi(indexes.mul(deltas.getColumn(s)))
       m_t.addi(indexes.mul(gammas.getColumn(s)))
@@ -804,7 +807,7 @@ object Prophet {
     val kCumulative = concat(0, create(Array.fill(changePoints.length())(k)), deltas.cumsum(0).add(k))
     val gammas = create(Array.fill(changePoints.length)(0d))
 
-    (0 until changePoints.length()).foreach(s => {
+    (0 until changePoints.length()).par.foreach(s => {
       val value = (changePoints.getDouble(s) - m - sum(gammas, 0).getDouble(0)) *
         (1 - (kCumulative.getDouble(s) / kCumulative.getDouble(s + 1)))
       gammas.put(s, create(Array(value)))
@@ -812,19 +815,17 @@ object Prophet {
     val k_t = create(Array.fill(t.length())(k))
     val m_t = create(Array.fill(t.length())(m))
 
-    (0 until changePoints.length()).foreach(s => {
-      (0 until t.length()).foreach(t1 => {
-        if (t.getDouble(t1) > changePoints.getDouble(s)) {
-          k_t.put(t1, k_t.getColumn(t1).add(deltas.getColumn(s)))
-          m_t.put(t1, m_t.getColumn(t1).add(gammas.getColumn(s)))
-        }
-      })
+    (0 until changePoints.length()).par.foreach(s => {
+      val indexes = t.cond(new GreaterThan(changePoints.getDouble(s)))
+      k_t.addi(indexes.mul(deltas.getColumn(s)))
+      m_t.addi(indexes.mul(gammas.getColumn(s)))
     })
+
     cap.div(exp(k_t.mul(t.sub(m_t)).mul(-1)).add(1))
   }
 
-  private def makeAllSeasonalityFeatures(events: mutable.Map[String, INDArray],
-                                         seasonalities: Seq[Seasonality], regressors: Seq[Regressor]): SeasonalData = {
+  private def makeAllSeasonalityFeatures(events: ParMap[String, INDArray],
+                                         seasonalities: ParSeq[Seasonality], regressors: ParSeq[Regressor]): SeasonalData = {
     val typedDS = events("ds")
     var seasonalFeatures: Option[INDArray] = None
     var prior_scales: Stream[Double] = Stream.empty

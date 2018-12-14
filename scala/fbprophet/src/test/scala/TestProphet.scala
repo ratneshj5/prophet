@@ -8,6 +8,7 @@ import org.scalactic.{Equality, TolerantNumerics}
 import org.scalatest.FunSuite
 
 import scala.collection.mutable
+import scala.collection.parallel.mutable.ParMap
 
 /**
   * User: ratnesh
@@ -103,7 +104,7 @@ class TestProphet extends FunSuite {
 
   test("regularize") {
     val model = Prophet()
-    val events = model.prepare(events = mutable.Map("y" -> Nd4j.create(data.slice(0, length / 2).toArray), "ds" -> Nd4j.create(ds.slice(0, length / 2).toArray)), initializeScales = true)
+    val events = model.prepare(events = ParMap("y" -> Nd4j.create(data.slice(0, length / 2).toArray), "ds" -> Nd4j.create(ds.slice(0, length / 2).toArray)), initializeScales = true)
 
     assert(events.contains("t"))
     assert(Nd4j.max(events("t")).getDouble(0) == 1d)
@@ -156,7 +157,7 @@ class TestProphet extends FunSuite {
   }
 
   test("getChangePoints") {
-    val history: mutable.Map[String, INDArray] = mutable.Map("y" -> Nd4j.create(data.slice(0, length / 2).toArray), "ds" -> Nd4j.create(ds.slice(0, length / 2).toArray))
+    val history: ParMap[String, INDArray] = ParMap("y" -> Nd4j.create(data.slice(0, length / 2).toArray), "ds" -> Nd4j.create(ds.slice(0, length / 2).toArray))
     val model = Prophet()
     model.history = model.prepare(events = history, initializeScales = true)
     model.setChangePoints()
@@ -168,7 +169,7 @@ class TestProphet extends FunSuite {
 
   test("setChangePointRange") {
 
-    val history: mutable.Map[String, INDArray] = mutable.Map("y" -> Nd4j.create(data.slice(0, length / 2).toArray), "ds" -> Nd4j.create(ds.slice(0, length / 2).toArray))
+    val history: ParMap[String, INDArray] = ParMap("y" -> Nd4j.create(data.slice(0, length / 2).toArray), "ds" -> Nd4j.create(ds.slice(0, length / 2).toArray))
     val model = Prophet(changePointRange = 0.4)
     model.history = model.prepare(events = history, initializeScales = true)
     model.setChangePoints()
@@ -189,7 +190,7 @@ class TestProphet extends FunSuite {
   }
 
   test("getZeroChangePoints") {
-    val history: mutable.Map[String, INDArray] = mutable.Map("y" -> Nd4j.create(data.slice(0, length / 2).toArray), "ds" -> Nd4j.create(ds.slice(0, length / 2).toArray))
+    val history: ParMap[String, INDArray] = ParMap("y" -> Nd4j.create(data.slice(0, length / 2).toArray), "ds" -> Nd4j.create(ds.slice(0, length / 2).toArray))
     val model = Prophet(nChangePoints = 0)
     model.history = model.prepare(events = history, initializeScales = true)
     model.setChangePoints()
@@ -200,7 +201,7 @@ class TestProphet extends FunSuite {
   }
 
   test("overridenChangePoints") {
-    val history: mutable.Map[String, INDArray] = mutable.Map("y" -> Nd4j.create(data.slice(0, 20).toArray), "ds" -> Nd4j.create(ds.slice(0, 20).toArray))
+    val history: ParMap[String, INDArray] = ParMap("y" -> Nd4j.create(data.slice(0, 20).toArray), "ds" -> Nd4j.create(ds.slice(0, 20).toArray))
     val model = Prophet()
     model.history = model.prepare(events = history, initializeScales = true)
     model.setChangePoints()
@@ -227,7 +228,7 @@ class TestProphet extends FunSuite {
 
   test("growthInit") {
     val model = Prophet(growth = "logistic")
-    var history: mutable.Map[String, INDArray] = mutable.Map("y" -> Nd4j.create(data.slice(0, 468).toArray),
+    var history: ParMap[String, INDArray] = ParMap("y" -> Nd4j.create(data.slice(0, 468).toArray),
       "ds" -> Nd4j.create(ds.slice(0, 468).toArray),
       "cap" -> Nd4j.create(Array.fill(468)(data.slice(0, 468).max)))
 
@@ -290,25 +291,25 @@ class TestProphet extends FunSuite {
     var model = Prophet()
     assert(model.weeklySeasonality == "auto")
     model.fit(history)
-    assert(model.seasonalities.map(a => a.name).contains("weekly"))
+    assert(model.seasonalities.map(a => a.name).toStream.contains("weekly"))
     assert(model.seasonalities.filter(a => a.name == "weekly") == mutable.Seq(Seasonality("weekly", 7, 3, 10)))
 
     //Should be disabled
     history = Map("y" -> Nd4j.create(data.slice(0, 9).toArray), "ds" -> Nd4j.create(ds.slice(0, 9).toArray))
     model = Prophet()
     model.fit(history)
-    assert(!model.seasonalities.map(a => a.name).contains("weekly"))
+    assert(!model.seasonalities.map(a => a.name).toStream.contains("weekly"))
 
     model = Prophet(weeklySeasonality = true)
     model.fit(history)
-    assert(model.seasonalities.map(a => a.name).contains("weekly"))
+    assert(model.seasonalities.map(a => a.name).toStream.contains("weekly"))
 
     // Should be False due to weekly spacing
     history = Map("y" -> Nd4j.create(data.zipWithIndex.filter(a => a._2 % 7 == 0).map(a => a._1).toArray),
       "ds" -> Nd4j.create(ds.zipWithIndex.filter(a => a._2 % 7 == 0).map(a => a._1).toArray))
     model = Prophet()
     model.fit(history)
-    assert(!model.seasonalities.map(a => a.name).contains("weekly"))
+    assert(!model.seasonalities.map(a => a.name).toStream.contains("weekly"))
 
     history = Map("y" -> Nd4j.create(data.toArray), "ds" -> Nd4j.create(ds.toArray))
     model = Prophet(weeklySeasonality = 2, seasonalityPriorScale = 3d)
@@ -322,18 +323,18 @@ class TestProphet extends FunSuite {
     var model = Prophet()
     assert(model.yearlySeasonality == "auto")
     model.fit(history)
-    assert(model.seasonalities.map(a => a.name).contains("yearly"))
+    assert(model.seasonalities.map(a => a.name).toStream.contains("yearly"))
     assert(model.seasonalities.filter(a => a.name == "yearly") == mutable.Seq(Seasonality("yearly", 365.25, 10, 10)))
 
     //Should be disabled
     history = Map("y" -> Nd4j.create(data.slice(0, 240).toArray), "ds" -> Nd4j.create(ds.slice(0, 240).toArray))
     model = Prophet()
     model.fit(history)
-    assert(!model.seasonalities.map(a => a.name).contains("yearly"))
+    assert(!model.seasonalities.map(a => a.name).toStream.contains("yearly"))
 
     model = Prophet(yearlySeasonality = true)
     model.fit(history)
-    assert(model.seasonalities.map(a => a.name).contains("yearly"))
+    assert(model.seasonalities.map(a => a.name).toStream.contains("yearly"))
 
     history = Map("y" -> Nd4j.create(data.toArray), "ds" -> Nd4j.create(ds.toArray))
     model = Prophet(yearlySeasonality = 7, seasonalityPriorScale = 3)
@@ -347,18 +348,18 @@ class TestProphet extends FunSuite {
     var model = Prophet()
     assert(model.dailySeasonality == "auto")
     model.fit(history)
-    assert(model.seasonalities.map(a => a.name).contains("daily"))
+    assert(model.seasonalities.map(a => a.name).toStream.contains("daily"))
     assert(model.seasonalities.filter(a => a.name == "daily") == mutable.Seq(Seasonality("daily", 1, 4, 10)))
 
     //Should be disabled
     history = Map("y" -> Nd4j.create(data2.slice(0, 430).toArray), "ds" -> Nd4j.create(ds2.slice(0, 430).toArray))
     model = Prophet()
     model.fit(history)
-    assert(!model.seasonalities.map(a => a.name).contains("daily"))
+    assert(!model.seasonalities.map(a => a.name).toStream.contains("daily"))
 
     model = Prophet(dailySeasonality = true)
     model.fit(history)
-    assert(model.seasonalities.map(a => a.name).contains("daily"))
+    assert(model.seasonalities.map(a => a.name).toStream.contains("daily"))
 
     history = Map("y" -> Nd4j.create(data2.toArray), "ds" -> Nd4j.create(ds2.toArray))
     model = Prophet(dailySeasonality = 7, seasonalityPriorScale = 3)
@@ -368,7 +369,7 @@ class TestProphet extends FunSuite {
     history = Map("y" -> Nd4j.create(data.toArray), "ds" -> Nd4j.create(ds.toArray))
     model = Prophet()
     model.fit(history)
-    assert(!model.seasonalities.map(a => a.name).contains("daily"))
+    assert(!model.seasonalities.map(a => a.name).toStream.contains("daily"))
   }
 
   test("addCustomSeasonality") {
@@ -388,7 +389,7 @@ class TestProphet extends FunSuite {
     model.addSeasonality("monthly", 30, 5, Some(2), Some("additive"))
     val history: Map[String, INDArray] = Map("y" -> Nd4j.create(data.toArray), "ds" -> Nd4j.create(ds.toArray))
     model.fit(history)
-    assert(model.seasonalities.filter(a => a.name == "monthly").map(a => a.mode).contains("additive"))
-    assert(model.seasonalities.filter(a => a.name == "weekly").map(a => a.mode).contains("multiplicative"))
+    assert(model.seasonalities.filter(a => a.name == "monthly").map(a => a.mode).toStream.contains("additive"))
+    assert(model.seasonalities.filter(a => a.name == "weekly").map(a => a.mode).toStream.contains("multiplicative"))
   }
 }
